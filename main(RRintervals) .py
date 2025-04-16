@@ -50,7 +50,7 @@ class AlexNet(nn.Module):
 
         self.classifier = nn.Sequential(
         nn.Dropout(),
-        nn.Linear(256 * 6 * 6, 4096),
+        nn.Linear(256 * 6 * 6 +4, 4096), # Add 4 index for RR Interval
         nn.ReLU(inplace=True),
         nn.Dropout(),
         nn.Linear(4096, 4096),
@@ -58,10 +58,11 @@ class AlexNet(nn.Module):
         nn.Linear(4096, 4),  # Output layer
         )
     
-    def forward(self, x):
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+    def forward(self, x1, x2):
+        x1 = self.features(x)
+        x1 = self.avgpool(x)
+        x1 = torch.flatten(x, 1)  # Flatten the output of the last pooling layer
+        x = torch.cat((x1, x2), dim=1)  # Concatenate the features and RR intervals
         x = self.classifier(x)
         return x
 
@@ -76,7 +77,7 @@ def worker(data, wavelet, scales, sampling_period):
     # for remove inter-patient variation
     avg_rri = np.mean(np.diff(r_peaks))
 
-    x, y, groups = [], [], []
+    x1, x2, y, groups = [], [], [], []
     for i in range(len(r_peaks)):
         if i == 0 or i == len(r_peaks) - 1:
             continue
@@ -86,18 +87,17 @@ def worker(data, wavelet, scales, sampling_period):
 
         # Convert scalogram to RGB scale
         grayscale = cv2.resize(coeffs[:, r_peaks[i] - before: r_peaks[i] + after], (227, 227))
-        x.append(cv2.merge([grayscale, grayscale, grayscale]))  # Convert to RGB
-
-        # x2.append([
-        #     r_peaks[i] - r_peaks[i - 1] - avg_rri,  # previous RR Interval
-        #     r_peaks[i + 1] - r_peaks[i] - avg_rri,  # post RR Interval
-        #     (r_peaks[i] - r_peaks[i - 1]) / (r_peaks[i + 1] - r_peaks[i]),  # ratio RR Interval
-        #     np.mean(np.diff(r_peaks[np.maximum(i - 10, 0):i + 1])) - avg_rri  # local RR Interval
-        # ])
+        x1.append(cv2.merge([grayscale, grayscale, grayscale]))  # Convert to RGB
+        x2.append([
+            r_peaks[i] - r_peaks[i - 1] - avg_rri,  # previous RR Interval
+            r_peaks[i + 1] - r_peaks[i] - avg_rri,  # post RR Interval
+            (r_peaks[i] - r_peaks[i - 1]) / (r_peaks[i + 1] - r_peaks[i]),  # ratio RR Interval
+            np.mean(np.diff(r_peaks[np.maximum(i - 10, 0):i + 1])) - avg_rri  # local RR Interval
+        ])
         y.append(categories[i])
         groups.append(data["record"])
 
-    return x, y, groups
+    return x1, x2, y, groups
 
 
 def load_data(wavelet, scales, sampling_rate, filename="./dataset/mitdb.pkl"):
@@ -110,37 +110,41 @@ def load_data(wavelet, scales, sampling_rate, filename="./dataset/mitdb.pkl"):
     cpus = 22 if joblib.cpu_count() > 22 else joblib.cpu_count() - 1  # for multi-process
 
     # for training
-    x_train, y_train, groups_train = [], [], []
+    x1_train, x2_train, y_train, groups_train = [], [], [], []
     with ProcessPoolExecutor(max_workers=cpus) as executor:
-        for x, y, groups in executor.map(
+        for x1, x2, y, groups in executor.map(
                 partial(worker, wavelet=wavelet, scales=scales, sampling_period=1. / sampling_rate), train_data):
-            x_train.append(x)
+            x1_train.append(x1)
+            x2_train.append(x2)
             y_train.append(y)
             groups_train.append(groups)
 
-    x_train = np.concatenate(x_train, axis=0).astype(np.float32)  # No need for expand_dims, as RGB already has 3 channels
+    x1_train = np.concatenate(x1_train, axis=0).astype(np.float32)  # No need for expand_dims, as RGB already has 3 channels
+    x2_train = np.concatenate(x2_train, axis=0).astype(np.float32)
     y_train = np.concatenate(y_train, axis=0).astype(np.int64)
     groups_train = np.concatenate(groups_train, axis=0)
 
     # for test
-    x_test, y_test, groups_test = [], [], []
+    x1_test, x2_test, y_test, groups_test = [], [], [], []
     with ProcessPoolExecutor(max_workers=cpus) as executor:
-        for x, y, groups in executor.map(
+        for x1, x2, y, groups in executor.map(
                 partial(worker, wavelet=wavelet, scales=scales, sampling_period=1. / sampling_rate), test_data):
-            x_test.append(x)
+            x1_test.append(x1)
+            x2_test.append(x2)
             y_test.append(y)
             groups_test.append(groups)
 
-    x_test = np.concatenate(x_test, axis=0).astype(np.float32)
+    x1_test = np.concatenate(x1_test, axis=0).astype(np.float32)  # No need for expand_dims, as RGB already has 3 channels
+    x2_test = np.concatenate(x2_test, axis=0).astype(np.float32)
     y_test = np.concatenate(y_test, axis=0).astype(np.int64)
     groups_test = np.concatenate(groups_test, axis=0)
 
-    # normalization
-#     # scaler = RobustScaler()
-#     # x2_train = scaler.fit_transform(x2_train)
-#     # x2_test = scaler.transform(x2_test)
+    #normalization
+    scaler = RobustScaler()
+    x2_train = scaler.fit_transform(x2_train)
+    x2_test = scaler.transform(x2_test)
 
-    return (x_train, y_train, groups_train), (x_test, y_test, groups_test)
+    return (x1_train, x2_train, y_train, groups_train), (x1_test, x2_test, y_test, groups_test)
 
 
 def plot_confusion_matrix_percentage(y_true, y_pred):
@@ -156,7 +160,7 @@ def main():
     wavelet = "mexh"  # mexh, morl, gaus8, gaus4
     scales = pywt.central_frequency(wavelet) * sampling_rate / np.arange(1, 101, 1)
 
-    (x_train, y_train, groups_train), (x_test, y_test, groups_test) = load_data(
+    (x1_train, x2_train, y_train, groups_train), (x1_test, x2_test, y_test, groups_test) = load_data(
         wavelet=wavelet, scales=scales, sampling_rate=sampling_rate)
     print("Data loaded successfully!")
 
@@ -177,15 +181,15 @@ def main():
         lr=0.001,
         max_epochs=30,
         batch_size=1024,
-        train_split=predefined_split(Dataset(x_test, y_test)),
+        train_split=predefined_split(Dataset({"x1":x1_test, "x2": x2_test}, y_test)),
         verbose=1,
         device="cuda",
         callbacks=callbacks,
         iterator_train__shuffle=True,
         optimizer__weight_decay=0,
     )
-    net.fit(x_train, y_train)
-    y_true, y_pred = y_test, net.predict(x_train)
+    net.fit({"x1":x1_train, "x2": x2_train}, y_train)
+    y_true, y_pred = y_test, net.predict({"x1":x1_train, "x2": x2_train})
 
     print(confusion_matrix(y_true, y_pred))
     plot_confusion_matrix_percentage(y_true, y_pred)
